@@ -1,0 +1,1484 @@
+---
+title: "Modern Data Mining: Movie Series Analytics"
+author:
+- Sung-Ho Park
+- Ingon Lee
+- Wichinpong Sinchaisri
+
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: '4'
+  html_document:
+    code_folding: show
+    highlight: haddock
+    theme: lumen
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+  word_document:
+    toc: yes
+    toc_depth: '4'
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=60),tidy=TRUE, 
+                      echo=FALSE, fig.width=8, fig.height=4, warning=FALSE, message=FALSE)
+# check if you have ISLR package, if not, install it
+if(!require('pacman')) {install.packages('pacman')}
+pacman::p_load(randomForest, tree, ISLR, rpart, rpart.plot, rattle, pROC, 
+               partykit, ggplot2, glmnet, leaps, dplyr, data.table, gplots, 
+               stargazer, tm, SnowballC, RColorBrewer, wordcloud, ranger, 
+               stringr, caret, e1071, caTools, nnet, formatR, Hmisc, 
+               gridExtra, hydroGOF, jsonlite)
+
+cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", 
+               "#0072B2", "#D55E00", "#CC79A7")
+
+# helper functions
+RMSE = function(m, o){
+  sqrt(mean((m - o)^2))
+}
+```
+
+# Executive Summary
+
+Production companies often release series of movies rather than a single movie alone. We analyze the quality and commercial success of these movie franchises, focusing on how well we can predict the success of the next movie in a series. The current movie in a series is a relatively accurate predictor of the IMDb rating and domestic revenue of the movie following it. More advanced models, including LASSO regression, classification and regression tree, and random forest, do better than this baseline approach, often when a small number of predictors is involved. We also look at the historical performance of the James Bond movie franchise and use our insights to predict the quality of the upcoming Bond movie \textit{No Time to Die} and how well it will do in the box office. Recent trends in rebooting and remaking movies inspire us to build a predictive model to help filmmakers decide whether the next movie in the series should be a sequel or a reboot. Textual analysis from the plots provided by the movie providers, as opposed to the reviews from the reviewers is also included.
+
+\newpage
+
+# Introduction
+
+Production companies often release series of movies rather than a single movie alone. Some of these series involve movies building on the plot of previous releases, such as the Bourne Trilogy, while others follow a particular theme or character, such as the James Bond series. We analyze the quality and commercial success of movie franchises and make recommendations on potential sequels.
+
+Using a dataset of movie series we build models to predict the rating and the revenue of the next movie in a series. We consider multinomial regression, CART, and random forest models, and find that they do better than the baseline, usually when a small number of predictors is used. We then look at two subsets of our data and perform a more detailed analysis. The first is James Bond movies. We find that the Bond actor is an important variable in predicting ratings of future Bond films. We also make predictions on the movie \textit{No Time to Die} coming out in April 2020. The second dataset is movie series containing reboots of series – where the storyline and usually the cast significantly change. We consider various models which can be used to decide if the next movie should be a sequel or a reboot and make recomendations for a few particular movie series.
+
+Lastly, we conduct textual analysis to see if the plots provided by the movie providers show predictive power. The plots from unique movies are often neutral in a way that the filmmakers use narrative tones. This might indicate that the plots could have different implications from the reviews.
+
+# Data
+
+We obtain movie data from three sources. Using the "Lists of Film Series" from Wikipedia we obtain lists of movie series, so that for each movie we obtain its name and the name of the series. We then get movie characteristics in the IMDb database by scraping the relevant webpages on the OMDb website. Below is the list of IMDb characteristics downloaded for each movie: series name (such as `Batman` and `James Bond`), movie name (such as `The Dark Knight` and `Skyfall`), year of release, MPAA rating, release date, runtime, genres (indicator variable for each genre), languages in movie, countries in movie, number of award wins, number of award nominations, metascore, IMDb rating, number of IMDb votes, number of movie in series (calculated by us).
+
+We find the numbers for production budget, domestic revenue, and international revenue on the Box Office Mojo website. In particular, we obtain the following variables: production budget, domestic total gross revenue, international revenue (non-adjusted not used in analysis), and total revenue (domestic plus international non-adjusted not used in analysis).
+
+In order to make these numbers comparable across different years, we convert them to 2019 dollars. For adjusting we use the Adjuster function on the Box Office Mojo website. This gives us the Domestic Total Gross number. By calculating the ratio of adjusted domestic revenue to non-adjusted revenue, we find an adjustment factor. This factor is used to also adjust production budget. While using the same factor is not necessarily accurate, we believe that it gives a reasonable adjustment.
+
+In the end, we have two datasets. The "individual movies" dataset has each movie as a separate observation, along with characteristics and revenue and production numbers. The "pairs of movies" has in each observation a pair of movies: a movie in a series, and the one following it (again, with their characteristics).
+
+```{r, echo=F}
+#movies <- fread("data-movies.csv") # individual movie
+mpairs <- fread("data-fin.csv") # pairs
+
+mpairs[, release := as.Date(release, format = "%m/%d/%Y")]
+mpairs[, release2 := as.Date(release2, format = "%m/%d/%Y")]
+mpairs[, ReleaseDiff := as.numeric(difftime(release2, release, units = "days"))]
+mpairs <- mpairs[order(series, release)]
+
+# To get the index of the movie in the series
+mpairs$sn <- 1
+mpairs[, seriesNo := cumsum(sn), by = series]
+mpairs[, seriesNo := seriesNo + 1]
+mpairs[, sn := NULL]
+
+mpairs[, nominations := as.numeric(nominations)]
+mpairs[, nominations2 := as.numeric(nominations2)]
+mpairs[, wins := as.numeric(wins)]
+mpairs[, wins2 := as.numeric(wins2)]
+
+# Data manipulation
+# bins for IMDb Rating
+# cut2(mpairs$imdbRating, g = 5) # [3.3,5.9) [5.9,6.6) [6.6,7.1) [7.1,7.7) [7.7,9.2]
+# cut2(mpairs$imdbRating2, g = 5) # [2.2,5.5) [5.5,6.3) [6.3,6.7) [6.7,7.4) [7.4,9.0]
+# cut2(c(mpairs$imdbRating2, mpairs$imdbRating), g = 5) # [2.2,5.7) [5.7,6.4) [6.4,6.9) [6.9,7.5) [7.5,9.2]
+# v1 <- c(0, 5.5, 6.5, 7, 7.5, 10)
+# v1 <- c(0, 5.7, 6.4, 6.9, 7.5, 10) # old
+v1 <- c(0, 5.1, 5.9, 6.7, 7.5, 10) # final
+
+mpairs$RateGr<- cut(mpairs$imdbRating, v1)
+mpairs$RateGr2<- cut(mpairs$imdbRating2, v1)
+
+# bins for Revenue
+# ggplot(mpairs, aes(Domestic)) + geom_bar()
+v2 = c(0, 1 * 10^8, 2 * 10^8, 3 * 10^8, 4 * 10^8, 10^10)
+
+mpairs$Rev1 <- cut(mpairs$domestic, v2)
+mpairs$Rev2 <- cut(mpairs$domestic2, v2)
+
+# bins for Production
+# First make sure to eliminate observations with missing
+# production budget values
+# mpairs = subset(mpairs, mpairs$Production.Budget > 0)
+# mpairs = subset(mpairs, mpairs$ProductionBudget2 > 0)
+# v3 = c(0, 0.5 * 10^8, 1 * 10^8, 1.5 * 10^8, 2 * 10^8, 10^10)
+# mpairs$Prod2<- cut(mpairs$ProductionBudget2, v3)
+
+# bins for release difference
+v4 = c(0, 500, 10^5)
+mpairs$relBuck = cut(mpairs$ReleaseDiff, v4)
+```
+
+## Descriptive
+
+There are 475 movies and 348 pairs of movies in the two datasets.
+
+```{r, echo=F}
+hist(mpairs$imdbRating, main="Histogram of imdbRating", 
+     xlab="imdbRating", ylab="Frequency")
+```
+
+As can be seen in the histogram of the `imdbRating`, a large proportion of movies are concentrated between 6 and 8.
+
+```{r}
+mpairs.nonull <- mpairs[!(mpairs$production.budget=="-999"),]
+#summary(mpairs.nonull)
+ggplot(mpairs.nonull, aes(x = mpairs.nonull$production.budget, 
+                          y = mpairs.nonull$imdbRating)) + labs(
+                            title="Budget and Rating", x="Production Budget", 
+                            y="imdbRating") + geom_point() + geom_smooth(method = "lm", se = FALSE)
+```
+
+```{r}
+ggplot(mpairs.nonull, aes(x = mpairs.nonull$production.budget, 
+                          y = mpairs.nonull$domestic)) + 
+  labs(title="Budget and Domestic Revenue", x="Production Budget", 
+       y="Domestic Revenue") + geom_point() + geom_smooth(method = "lm", se = FALSE)
+```
+
+```{r}
+ggplot(mpairs.nonull, aes(x = mpairs.nonull$domestic, 
+                          y = mpairs.nonull$domestic2)) + 
+  labs(title="Domestic Revenue Comparison", x="Domestic Revenue", 
+       y="Domestic Revenue 2") + geom_point() + 
+  geom_smooth(method = "lm", se = FALSE)
+```
+
+From the above figures, we can observe that there are positive correlations between production budget and imdbRating, and between production budget and domestic revenue. Moreover, we can observe that there is a positive correlation between domestic revenue in previous movie and domestic revenue in next movie in the same series.
+
+# Predicting Movie Ratings
+
+We compare models for predicting the rating of the next movie in the series. We consider three approaches – LASSO (multinomial) logistic regression, CART (with cross-validation) and random forest. For Lasso, we compare models with lambda.min, lambda.1se, and 5 nonzero coefficients. For the rest, five different sets of predictors for each approach. The rating of the movie to be predicted by multinomial regression, CART, and random forest, is split into five buckets: [0, 5.1], (5.1, 5.9], (5.9, 6.7], (6.7, 7.5], (7.5, 10]. We train the models on a training set containing 70% of observations (after a random split) and then look at accuracy on the test set.
+
+The baseline approach of predicting each movie will have rating in the range (5.9, 6.7], which is the largest rating bucket in our data, gives 34.29% accuracy, while predicting the next movie will have the same rating as the previous one gives 46.67% accuracy. The variable importance plot suggests that `imdbRating`, `imdbVote`, `runtime2`, `domestic`, `nominations`, `ReleaseDiff`, and `wins` are the most predictive.
+
+```{r, echo=F, results="hide"}
+#Remove rows for which production.budget is missing
+mpairs.nonull <- mpairs[!(mpairs$production.budget==-999),]
+mpairs.nonull2 <- mpairs[!(mpairs$production.budget2==-999),]
+
+#Remove unneeded variables and variables for which there would be 
+# data only after later movie (movie2) has been in theaters.
+data2 <- mpairs.nonull2 %>%
+  select(-c("series", "title", "release", "awards", "plot", 
+            "imdbRating", "domestic", "boxoffice", "country", 
+            "country2", "title2", "release2", "awards2", "wins2", 
+            "language", "language2", "nominations2","imdbRating2", 
+            "metascore2", "rottenscore2", "boxoffice2", "imdbVote2", 
+            "plot2", "domestic2", "ReleaseDiff", "relBuck"))
+data3 <- na.omit(data2)
+
+#Split training and test
+set.seed(17)
+spl = sample.split(data3$RateGr2, SplitRatio = 0.7)
+pairsTrain2 <- subset(data3, spl==TRUE)
+pairsTest2 <- subset(data3, spl==FALSE)
+```
+
+```{r, echo=F, results="hide"}
+# Model to predict RateGr2
+train_rate <- pairsTrain2 %>% select(-c("Rev2"))
+test_Rate <- pairsTest2 %>% select(-c("Rev2"))
+y_rate <- train_rate$RateGr2
+x_rate <- model.matrix(RateGr2~., data=train_rate)[,-1]
+fit.cv.rate <- cv.glmnet(x_rate, y_rate, alpha=1,family="multinomial",
+                         nfolds=10, type.measure="deviance")
+plot(fit.cv.rate)
+
+coef.min <- coef(fit.cv.rate, s="lambda.min")
+coef.1se <- coef(fit.cv.rate, s="lambda.1se")
+coef.5nzero <- coef(fit.cv.rate, nzero=5)
+
+#coef.min
+#Gives: rated, mystery, rottenscore, imdbVote, year2, runtime2, thriller2, seriesNo, Rev1
+
+#coef.1se
+#Gives: rottenscore, imdbVote, runtime2
+
+#coef.5nzero: rottenscore, imdbVote, runtime2
+```
+
+```{r, echo=F, results="hide"}
+# Model to predict RateGr2: Compare testing error
+rate.model.min <- multinom(RateGr2~rated+mystery+rottenscore+ imdbVote+year2+runtime2+thriller2+seriesNo+Rev1, data=train_rate)
+rate.model.1se <- multinom(RateGr2~imdbVote+runtime2+rottenscore, data=train_rate)
+#Testing error for min
+testingerror.min <- mean(test_Rate$RateGr2!=predict(rate.model.min, test_Rate))
+testingerror.1se <- mean(test_Rate$RateGr2!=predict(rate.model.1se, test_Rate))
+testingerror.min #0.5921053
+testingerror.1se #0.6578947
+```
+
+```{r, echo=F}
+# Trees
+# Split data into training and testing sets
+set.seed(17)
+spl = sample.split(mpairs$RateGr2, SplitRatio = 0.7)
+pairsTrain <- subset(mpairs, spl==TRUE)
+pairsTest <- subset(mpairs, spl==FALSE)
+# table(pairsTrain$RateGr2)
+
+# baseline - predict Rating 2 in same bucket as Rating 1
+table1 <- table(pairsTest$RateGr, pairsTest$RateGr2)
+# table1
+# sum(diag(table1))/sum(table1) # 0.4285714
+
+# baseline - predict Rating 2 is in (5.9,6.7] bucket
+table1 <- table(pairsTest$RateGr2)
+# table1[3]/sum(table1) # 0.3428571 
+
+# All variables
+tmp <- lm(imdbRating2 ~ domestic + wins + nominations + imdbRating + imdbVote + runtime2 + action2 + adventure2 + crime2 + drama2 + fantasy2 + thriller2 + horror2 + scifi2 + war2 + comedy2 + family2 + animation2 + ReleaseDiff + relBuck + seriesNo, data = pairsTrain)
+# summary(tmp) # domestic (-), wins (-), imdbRating (+), imdbVote (+), runtime2 (+), adventure2 (+), animation2 (+)
+
+tmp <- randomForest(RateGr2 ~ domestic + wins + nominations + imdbRating + imdbVote + runtime2 + action2 + adventure2 + crime2 + drama2 + fantasy2 + thriller2 + horror2 + scifi2 + war2 + comedy2 + family2 + animation2 + ReleaseDiff + relBuck + seriesNo, data = pairsTrain[!is.na(wins) & !is.na(nominations),])
+# prp(tmp) # Tree: imdbRating, runtime2, domestic, animation2, compdy2, thriller, wins
+# OOB 53.16%
+varImpPlot(tmp, main="Variable Importance Plot for Rating Prediction") # imdbRating, imdbVote, runtime2, domestic, nominations, ReleaseDiff, wins
+```
+
+
+```{r, echo=F, results="hide"}
+# Classification and regression tree
+numFolds <- trainControl(method="cv", number=10)
+cpGrid <- expand.grid(.cp = seq(0.001,0.100,0.001))
+set.seed(1)
+
+# Model 1 - just previous rating
+train(RateGr2 ~ imdbRating, data = pairsTrain, method="rpart", trControl = numFolds, tuneGrid = cpGrid)
+
+# best value cp = 0.007
+ansTree1 = rpart(RateGr2 ~ imdbRating, data = pairsTrain,
+ method="class", cp=0.007)
+# prp(ansTree1)
+predCART1 = predict(ansTree1, newdata = pairsTest, type = "class")
+table1 = table(pairsTest$RateGr2, predCART1)
+# table1
+# sum(diag(table1))/sum(table1) # 0.4952381
+
+# Model 2
+train(RateGr2 ~ imdbRating + Rev1 + runtime2 + imdbVote, 
+      data = pairsTrain, method="rpart", 
+      trControl = numFolds, tuneGrid = cpGrid)
+
+# best value 0.014
+ansTree2 = rpart(RateGr2 ~ imdbRating + Rev1 + runtime2 + imdbVote, 
+                 data = pairsTrain, method="class", cp=0.014)
+# prp(ansTree2)
+predCART2 = predict(ansTree2, newdata = pairsTest, type = "class")
+table2 = table(pairsTest$RateGr2, predCART2)
+# table2
+# sum(diag(table2))/sum(table2) # 0.4285714
+
+# Model 3
+train(RateGr2 ~ imdbRating + Rev1 + runtime2 + imdbVote
+      + animation2 + adventure2, data = pairsTrain, method="rpart", 
+      trControl = numFolds, tuneGrid = cpGrid)
+
+# best value 0.013
+ansTree3 = rpart(RateGr2 ~ imdbRating + Rev1 + runtime2 + imdbVote
+      + animation2 + adventure2, data = pairsTrain, 
+                 method="class", cp=0.013)
+
+# prp(ansTree3)
+predCART3 = predict(ansTree3, newdata = pairsTest, type = "class")
+table3 = table(pairsTest$RateGr2, predCART3)
+# table3
+# sum(diag(table3))/sum(table3) # 0.4190476
+
+# Model 4
+train(RateGr2 ~ imdbRating + imdbVote + runtime2 + Rev1
+      + relBuck, data = pairsTrain, method="rpart", 
+      trControl = numFolds, tuneGrid = cpGrid)
+
+# best value 0.01
+ansTree4 = rpart(RateGr2 ~ imdbRating + imdbVote + runtime2 + Rev1
+      + relBuck, data = pairsTrain, method="class", cp=0.01)
+
+# prp(ansTree4)
+predCART4 = predict(ansTree4, newdata = pairsTest, type = "class")
+table4= table(pairsTest$RateGr2, predCART4)
+# table4
+# sum(diag(table4))/sum(table4) # 0.3904762
+```
+
+```{r, echo=F}
+# Random forests
+set.seed(1)
+
+ansForest1 = randomForest(RateGr2 ~ imdbRating, 
+                         data = pairsTrain, ntree=50, nodesize=25)
+ansForest2 = randomForest(RateGr2 ~ imdbRating + Rev1 + runtime2 
+                          + horror2 + seriesNo + relBuck, 
+                          data = pairsTrain, ntree=50, nodesize=25)
+ansForest3 = randomForest(RateGr2 ~ imdbRating + Rev1 + runtime2 
+                          + horror2 + action2 + adventure2 + seriesNo, 
+                         data = pairsTrain, ntree=50, nodesize=25)
+ansForest4 = randomForest(RateGr2 ~ imdbRating + Rev1 + runtime2
+                          + horror2 + seriesNo + relBuck, 
+                         data = pairsTrain, ntree=50, nodesize=25)
+
+predForest1 = predict(ansForest1, newdata = pairsTest, type = "class")
+predForest2 = predict(ansForest2, newdata = pairsTest, type = "class")
+predForest3 = predict(ansForest3, newdata = pairsTest, type = "class")
+predForest4 = predict(ansForest4, newdata = pairsTest, type = "class")
+
+ftable1 = table(pairsTest$RateGr2, predForest1)
+ftable2 = table(pairsTest$RateGr2, predForest2)
+ftable3 = table(pairsTest$RateGr2, predForest3)
+ftable4 = table(pairsTest$RateGr2, predForest4)
+
+# sum(diag(ftable1))/sum(ftable1) # 49.52%
+# sum(diag(ftable2))/sum(ftable2) #  41.90%
+# sum(diag(ftable3))/sum(ftable3) #  42.86%
+# sum(diag(ftable4))/sum(ftable4) # 41.90%
+
+# Multinomial regression with a small number of regressors (model 2) does best among the more advanced approaches, with an accuracy of 46.7%.
+```
+
+The baseline approach of predicting each movie will have rating in the range (5.9, 6.7] gives 34.29% accuracy, while predicting the next movie will have the same rating as the previous one gives 42.86% accuracy. Multinomial LASSO regression with lambda.min yields an out-of-sample accuracy of 41%. Classification tree and random forest perform quite well (accuracy 49.52%), performing better when only the rating of the previous movie was used. We believe this happens because we have a small number of observations (only 350), so using too many predictors results in overfitting and poor out-of-sample accuracy.
+
+```{r, echo=F}
+prp(ansTree1) # best classification tree
+```
+
+The figure above is the classification tree when only the rating of the previous movie is used. We find that the rating of the next movie is predicted to be lower, with the drop in rating usually being more extreme is the movie has poor quality.
+
+Finally, we note that we also considered a smaller dataset with 229 observations for which production budget numbers are available. Production budget is now included in each of the five models. We obtain similar results this time random forest provides the best performance.
+
+# Predicting Movie Revenue
+
+As a measure of commercial success, we focus on only domestic revenue to avoid foreign exchange rate and other unforeseeable issues. We compare models for predicting the domestic revenue of the next movie in the series using three approaches: LASSO (multinomial) logistic regression, classification and regression tree (with cross-validation), and random forest. For Lasso, we compare models using lambda.min, lambda.1se, and 5 nonzero coefficients. For the rest, we use five different sets of predictors for each approach. The revenue of the movie to be predicted is split into five buckets: [0, $100 MM] (`losers`), ($100 MM, $200 MM] (`tossups`), ($200 MM, $300 MM] (`moneymakers`), ($300 MM, $400 MM] (`mega-moneymakers`), ($400 MM, $1 B] (`Avatar/Titanic-ish`). These names are used in the Los Angeles Times reviews (except the last one that we coined the name ourselves), and we use the average (median) production budget of $104.52 MM ($96.01 MM) together with domestic revenue for each movie to classify the data into groups. The models are trained on a training set containing 70% of observations (after a random split) and tested for accuracy on the test set.
+
+```{r, echo=F, results="hide"}
+# Predict new revenue
+
+set.seed(17)
+spl = sample.split(mpairs$Rev2, SplitRatio = 0.7)
+pairsTrain = subset(mpairs, spl==TRUE)
+pairsTest = subset(mpairs, spl==FALSE)
+# table(pairsTrain$Rev2)
+
+# baseline - predict Rev2 in same bucket as Rev1
+rtable1 = table(pairsTest$Rev1, pairsTest$Rev2)
+# rtable1
+# sum(diag(rtable1))/sum(rtable1)
+# Accuracy 50.48%
+
+# table(mpairs$Rev2)
+# 95/sum(table(mpairs$Rev2)) # Predict that always in #2 = 27.30%
+# 59/sum(table(mpairs$Rev2)) # Predict that always in #3 = 16.95%
+
+# All variables
+tmp <- lm(domestic2 ~ domestic + wins + nominations + imdbRating + imdbVote + runtime2 + action2 + adventure2 + crime2 + drama2 + fantasy2 + thriller2 + horror2 + scifi2 + war2 + comedy2 + family2 + animation2 + ReleaseDiff + relBuck + seriesNo, data = pairsTrain)
+# summary(tmp) # domestic (+), wins (-), imdbVote (+), horror (-), relBuck (-)
+
+tmp <- randomForest(Rev2 ~ domestic + wins + nominations + imdbRating + imdbVote + runtime2 + action2 + adventure2 + crime2 + drama2 + fantasy2 + thriller2 + horror2 + scifi2 + war2 + comedy2 + family2 + animation2 + ReleaseDiff + relBuck + seriesNo, data = pairsTrain[!is.na(wins) & !is.na(nominations),])
+# prp(tmp) # Tree: domestic, releaseDiff, imdbVote, runtime2, wins, crime2
+# OOB 44.54%
+varImpPlot(tmp, main="Variable Importance Plot for Revenue Prediction") # Domestic, imdbVote, runtime2, nominations, releaseDiff, wins, imdbRRating, seriesNo
+
+# Multinomial regression with a large number of regressors (models 3 and 5) does best among the more advanced predicting approaches
+```
+
+For the baseline, we predict each movie will earn the same range of domestic revenue as the previous one and the accuracy is 50.48%. We also consider the alternative baseline predicting the movie will turn out to be `tossups` (producing slightly more than its production budget however, the accuracy in this case is 27.30%, much worse than the former baseline. The variable importance plot above suggests that `domestic`, `imdbVote`, `runtime2`, `nominations`, `ReleaseDiff`, `wins`, `imdbRating`, and `seriesNo` are the most predictive variables.
+
+```{r, echo=F, results="hide"}
+#### Lasso Mutinomial Logsistic Regression
+# Split training and test
+set.seed(17)
+spl = sample.split(data3$Rev2, SplitRatio = 0.7)
+pairsTrain3 <- subset(data3, spl==TRUE)
+pairsTest3 <- subset(data3, spl==FALSE)
+
+set.seed(17)
+train_rev <- pairsTrain3 %>% select(-c("RateGr2"))
+test_rev <- pairsTest3 %>% select(-c("RateGr2"))
+
+y_rev <- train_rev$Rev2
+x_rev <- model.matrix(Rev2~., data=train_rev)[,-1]
+
+fit.cv.rev <- cv.glmnet(x_rev, y_rev, alpha=1, family="multinomial", nfolds=10, type.measure="deviance")
+
+plot(fit.cv.rev)
+
+coef.min.rev <- coef(fit.cv.rev, s="lambda.min")
+coef.1se.rev <- coef(fit.cv.rev, s="lambda.1se")
+coef.5nzero.rev <- coef(fit.cv.rev, nzero=5)
+
+#coef.min.rev
+#Gives: imdbVote, production.budget2, RateGr, Rev1
+
+#coef.1se.rev
+#Gives: imdbVote, Rev1
+
+#coef.5nzero.rev: imdbVote, Rev1
+
+# Model to predict Rev2: Compare Testing Error
+rev.model.min <- multinom(Rev2~imdbVote+production.budget2+RateGr+Rev1, data=train_rev)
+
+rev.model.1se <- multinom(Rev2~imdbVote + Rev1, data=train_rev)
+
+#Testing error for min
+testingerror.min.rev <- mean(test_rev$Rev2!=predict(rev.model.min, test_rev))
+
+testingerror.1se.rev <- mean(test_rev$Rev2!=predict(rev.model.1se, test_rev))
+
+testingerror.min.rev #0.5064935
+testingerror.1se.rev #0.4675325
+```
+
+Multinomial LASSO regression with lamda.1se does best among the more advanced predicting approaches with an out-of-sample accuracy of 53.5%. Classification tree (using just the domestic revenue of the previous movie) and random forest (model 4 with domestic revenue, number of votes on iMDB, number of awards won, whether it's an horror movie, and time between the two movies) perform quite well, beating the baseline at 53.33% and 52.43%, respectively. The figure below shows the classification tree when only the domestic revenue of the previous movie is used. We find that the revenue of the previous movie matters. If the previous movie is a "loser", the next movie will also lose money. Otherwise, next movie is predicted to be slightly worse or much better than previous one. When including production budget as one of the predictors, we yield similar results this time random forest provides the best performance. We also try models using continuous revenue instead of bucketed from the previous movie, instead of using five bins, but they give worse performance.
+
+```{r, echo=F, results="hide"}
+# CART
+numFolds <- trainControl(method="cv", number=10)
+cpGrid = expand.grid( .cp = seq(0.001,0.1,0.001))
+
+set.seed(17)
+
+# Model 1: domestic
+# Model 2: domestic + imdbVote
+# Model 3: domestic + imdbVote + wins + nominations + imdbRating
+# Model 4: domestic + imdbVote + wins + horror + relBuck
+# Model 5: domestic, imdbVote, runtime2, nominations, releaseDiff, wins, imdbRRating, seriesNo
+
+# Model 1
+train(Rev2 ~ domestic, data = pairsTrain, method="rpart", 
+      trControl = numFolds, tuneGrid = cpGrid)
+
+# best value 0.1
+ansTree1 = rpart(Rev2 ~ domestic, data = pairsTrain, method="class", cp=0.1)
+# prp(ansTree1)
+
+predCART1 = predict(ansTree1, newdata = pairsTest, type = "class")
+table1 = table(pairsTest$Rev2, predCART1)
+# table1
+# sum(diag(table1))/sum(table1) # 53.33%
+
+# Model 2
+train(Rev2 ~ domestic + imdbVote, data = pairsTrain, method="rpart", 
+      trControl = numFolds, tuneGrid = cpGrid)
+
+# best value 0.014
+ansTree2 = rpart(Rev2 ~ domestic + imdbVote, data = pairsTrain, 
+                 method="class", cp=0.014)
+# prp(ansTree2)
+
+predCART2 = predict(ansTree2, newdata = pairsTest, type = "class")
+table2 = table(pairsTest$Rev2, predCART2)
+# table2
+# sum(diag(table2))/sum(table2) # 52.38095%
+
+# Model 3
+train(Rev2 ~ domestic + imdbVote + wins + nominations 
+      + imdbRating, data = pairsTrain[!is.na(wins) & !is.na(nominations),], 
+      method="rpart", trControl = numFolds, tuneGrid = cpGrid)
+
+# best value 0.022
+ansTree3 = rpart(Rev2 ~ domestic + imdbVote + wins + nominations 
+      + imdbRating, data = pairsTrain[!is.na(wins) & !is.na(nominations),],
+      method="class", cp=0.022)
+# prp(ansTree3)
+predCART3 = predict(ansTree3, newdata = pairsTest, type = "class")
+table3 = table(pairsTest$Rev2, predCART3)
+# table3
+# sum(diag(table3))/sum(table3) # 0.4952381
+
+# Model 4
+train(Rev2 ~ domestic + imdbVote + wins + horror + relBuck, pairsTrain[!is.na(wins),], method="rpart", trControl = numFolds, tuneGrid = cpGrid)
+
+# best value 0.014
+ansTree4 = rpart(Rev2 ~ domestic + imdbVote + wins + horror +
+                 relBuck, pairsTrain[!is.na(wins),],
+                 method="class", cp= 0.014)
+# prp(ansTree4)
+predCART4 = predict(ansTree4, newdata = pairsTest, type = "class")
+table4 = table(pairsTest$Rev2, predCART4)
+# table4
+# sum(diag(table4))/sum(table4) # 49.52%
+
+# Model 5
+train(Rev2 ~ domestic + imdbVote + runtime2 + nominations + 
+        ReleaseDiff + wins +  imdbRating + seriesNo, 
+      data = pairsTrain[!is.na(wins) & !is.na(nominations),], 
+      method="rpart", trControl = numFolds, tuneGrid = cpGrid)
+
+# best value 0.022
+ansTree5 = rpart(Rev2 ~ domestic + imdbVote + runtime2 + nominations 
+                 + ReleaseDiff + wins +  imdbRating + seriesNo, 
+                 data = pairsTrain[!is.na(wins) & !is.na(nominations),],
+                 method="class", cp=0.022)
+
+# prp(ansTree5)
+predCART5 = predict(ansTree5, newdata = pairsTest, type = "class")
+table5 = table(pairsTest$Rev2, predCART5)
+# table5
+# sum(diag(table5))/sum(table5) # 0.4952381
+
+# Random Forest
+set.seed(17)
+ansForest1 <- randomForest(Rev2 ~ domestic, data = pairsTrain, ntree=50, nodesize=25)
+ansForest2 <- randomForest(Rev2 ~ domestic + imdbVote, data = pairsTrain, ntree=50, nodesize=25)
+ansForest3 <- randomForest(Rev2 ~  domestic + imdbVote + wins + nominations 
+      + imdbRating, data = pairsTrain[!is.na(wins) & !is.na(nominations),], ntree=50, nodesize=25)
+ansForest4 <- randomForest(Rev2 ~ domestic + imdbVote + wins + horror +
+                 relBuck, pairsTrain[!is.na(wins),], ntree=50, nodesize=25)
+ansForest5 <- randomForest(Rev2 ~ domestic + imdbVote + runtime2 + nominations 
+                 + ReleaseDiff + wins +  imdbRating + seriesNo, 
+                 data = pairsTrain[!is.na(wins) & !is.na(nominations),], 
+                 ntree=50, nodesize=25)
+
+predForest1 = predict(ansForest1, newdata = pairsTest, type = "class")
+predForest2 = predict(ansForest2, newdata = pairsTest, type = "class")
+predForest3 = predict(ansForest3, newdata = pairsTest, type = "class")
+predForest4 = predict(ansForest4, newdata = pairsTest, type = "class")
+predForest5 = predict(ansForest5, newdata = pairsTest, type = "class")
+
+table1 = table(pairsTest$Rev2, predForest1)
+table2 = table(pairsTest$Rev2, predForest2)
+table3 = table(pairsTest$Rev2, predForest3)
+table4 = table(pairsTest$Rev2, predForest4)
+table5 = table(pairsTest$Rev2, predForest5)
+
+# sum(diag(table1))/sum(table1) # 0.5047619
+# sum(diag(table2))/sum(table2) # 0.5047619
+# sum(diag(table3))/sum(table3) # 0.4466019
+# sum(diag(table4))/sum(table4) # 0.5242718
+# sum(diag(table5))/sum(table5) # 0.4563107
+```
+
+```{r, echo=F}
+prp(ansTree1) # Best tree
+```
+
+# Case Study: James Bond Series
+
+The James Bond movie franchise has existed since the 1960s and has produced 24 movies, many of them very well-known. We study the problem of predicting the rating and the revenue of the next Bond movie. The following figures plot the historical IMDb rating and revenue, respectively, for the bond movies, stratifying by the Bond actor. We see that generally Bond movies have pretty good quality (rating over 6.5) and have done well in the box office (domestic revenue around $200MM or higher). We also notice that movies with the same Bond actor tend to have similar ratings, while this pattern does not seem apparent when it comes to revenue. However, we osberve "trending" in historical revenue, whereby generally movies have earned less and less from 1965 to 1990, which was followed by a revival of the franchise, with movies again doing well in the box office, usually around $200 MM.
+
+```{r, echo=F}
+# James Bond
+bonds <- fread("data-bonds.csv")
+names(bonds)[5] <- "James.Bond"
+
+cbPalette = c("#00FF00", "#FFFF00", "#FF9933","#FF0000", "#33FFFF", "#3333FF", "#D55E00", "#CC79A7")
+
+# Domestic Revenue - color by James Bond Actor
+ggplot(bonds, aes(x = Year, y=Domestic, color = James.Bond)) +
+ geom_point(size = 3, shape = 16) +
+ geom_line(color = "blue", size = 1) +
+ggtitle("James Bond Movies Domestic Revenue") +
+ xlab("Year") + ylab("Domestic Revenue") +
+scale_colour_hue(h=c(10, 5000) + 80,
+name=paste("Bond Actor"),
+breaks=c("Sean Connery", "George Lazenby", "Roger Moore",
+"Timothy Dalton", "Pierce Brosnan", "Daniel Craig"),
+labels=c("Sean Connery", "George Lazenby", "Roger Moore",
+"Timothy Dalton", "Pierce Brosnan", "Daniel Craig")) +
+geom_text(size=3, color = "darkgreen", vjust= -0.5, hjust = -0.1, 
+data=subset(bonds, Domestic > 2.5 * 10 ^8 & Year < 1970),
+ aes(Year, Domestic,label=paste(paste(paste(Name, "("), Year), ")"))) +
+geom_text(size=3, color = "darkgreen", vjust= -0.5, hjust = 0.7, 
+data=subset(bonds, Domestic > 2.5 * 10 ^8 & Year > 1970),
+ aes(Year, Domestic,label=paste(paste(paste(Name, "("), Year), ")"))) +
+geom_text(size=3, color = "darkred", vjust= 1.0, hjust = 0.5, 
+data=subset(bonds, Domestic < 1.3 * 10 ^8 & Year < 1980),
+ aes(Year, Domestic,label=paste(paste(paste(Name, "("), Year), ")"))) +
+geom_text(size=3, color = "darkred", vjust= -0.5, hjust = -0.05, 
+data=subset(bonds, Domestic < 1.3 * 10 ^8 & Year < 1986 & Year > 1980),
+ aes(Year, Domestic,label=paste(paste(paste(Name, "("), Year), ")"))) +
+geom_text(size=3, color = "darkred", vjust= 0.2, hjust = -0.05, 
+data=subset(bonds, Domestic < 1.3 * 10 ^8 & Year > 1985 & Year < 1988),
+ aes(Year, Domestic,label=paste(paste(paste(Name, "("), Year), ")"))) +
+geom_text(size=3, color = "darkred", vjust= 1.0, hjust = 0.7, 
+data=subset(bonds, Domestic < 1.3 * 10 ^8 & Year > 1987),
+ aes(Year, Domestic,label=paste(paste(paste(Name, "("), Year), ")")))
+
+# IMDb ratings - color by James Bond Actor
+cbPalette = c("#00FF00", "#FFFF00", "#FF9933",
+ "#FF0000", "#33FFFF", "#3333FF")
+ggplot(bonds, aes(x = Year, y=imdbRating, color = James.Bond)) +
+ geom_point(size = 3, shape = 16) +
+ geom_line(color = "blue", size = 1) +
+ggtitle("James Bond Movies IMDb Ratings") +
+ xlab("Year") + ylab("IMDb Rating")  +
+scale_colour_hue(h=c(10, 5000) + 80,
+name=paste("Bond Actor"),
+breaks=c("Sean Connery", "George Lazenby", "Roger Moore",
+"Timothy Dalton", "Pierce Brosnan", "Daniel Craig"),
+labels=c("Sean Connery", "George Lazenby", "Roger Moore",
+"Timothy Dalton", "Pierce Brosnan", "Daniel Craig")) +
+geom_text(size=3, color = "darkgreen", vjust= -0.5, hjust = -0.04, 
+data=subset(bonds, imdbRating > 7.4  & Year < 1965),
+ aes(Year, imdbRating,label=paste(paste(paste(Name, "("), Year), ")"))) +
+geom_text(size=3, color = "darkgreen", vjust= -0.5, hjust = 0.7, 
+data=subset(bonds, imdbRating > 7.4  & Year > 2000),
+ aes(Year, imdbRating,label=paste(paste(paste(Name, "("), Year), ")"))) +
+geom_text(size=3, color = "darkred", vjust= 1.1, hjust = 0.0, 
+data=subset(bonds, imdbRating < 6.4),
+ aes(Year, imdbRating,label=paste(paste(paste(Name, "("), Year), ")")))
+
+# Domestic Revenue - color by Director
+ggplot(bonds, aes(x = Year, y=Domestic, color = Director)) +
+ geom_point(size = 3, shape = 16) +
+ geom_line(color = "blue", size = 1) +
+ggtitle("James Bond Movies Domestic Revenue") +
+scale_colour_hue(name=paste("Movie Director")) +
+ xlab("Year") + ylab("Domestic Revenue") +
+geom_text(size=3, color = "darkgreen", vjust= -0.5, hjust = -0.1, 
+data=subset(bonds, Domestic > 2.5 * 10 ^8 & Year < 1970),
+ aes(Year, Domestic,label=paste(paste(paste(Name, "("), Year), ")"))) +
+geom_text(size=3, color = "darkgreen", vjust= -0.5, hjust = 0.7, 
+data=subset(bonds, Domestic > 2.5 * 10 ^8 & Year > 1970),
+ aes(Year, Domestic,label=paste(paste(paste(Name, "("), Year), ")"))) +
+geom_text(size=3, color = "darkred", vjust= 1.0, hjust = 0.5, 
+data=subset(bonds, Domestic < 1.3 * 10 ^8 & Year < 1980),
+ aes(Year, Domestic,label=paste(paste(paste(Name, "("), Year), ")"))) +
+geom_text(size=3, color = "darkred", vjust= -0.5, hjust = -0.05, 
+data=subset(bonds, Domestic < 1.3 * 10 ^8 & Year < 1986 & Year > 1980),
+ aes(Year, Domestic,label=paste(paste(paste(Name, "("), Year), ")"))) +
+geom_text(size=3, color = "darkred", vjust= 0.2, hjust = -0.05, 
+data=subset(bonds, Domestic < 1.3 * 10 ^8 & Year > 1985 & Year < 1988),
+ aes(Year, Domestic,label=paste(paste(paste(Name, "("), Year), ")"))) +
+geom_text(size=3, color = "darkred", vjust= 1.0, hjust = 0.7, 
+data=subset(bonds, Domestic < 1.3 * 10 ^8 & Year > 1987),
+ aes(Year, Domestic,label=paste(paste(paste(Name, "("), Year), ")")))
+
+# IMDb ratings - color by Director
+ggplot(bonds, aes(x = Year, y=imdbRating, color = Director)) +
+ geom_point(size = 3, shape = 16) +
+ geom_line(color = "blue", size = 1) +
+ggtitle("James Bond Movies IMDb Ratings") +
+ xlab("Year") + ylab("IMDb Rating")  +
+scale_colour_hue(name=paste("Movie Director")) +
+geom_text(size=3, color = "darkgreen", vjust= -0.5, hjust = -0.04, 
+data=subset(bonds, imdbRating > 7.4  & Year < 1965),
+ aes(Year, imdbRating,label=paste(paste(paste(Name, "("), Year), ")"))) +
+geom_text(size=3, color = "darkgreen", vjust= -0.5, hjust = 0.7, 
+data=subset(bonds, imdbRating > 7.4  & Year > 2000),
+ aes(Year, imdbRating,label=paste(paste(paste(Name, "("), Year), ")"))) +
+geom_text(size=3, color = "darkred", vjust= 1.1, hjust = 0.0, 
+data=subset(bonds, imdbRating < 6.4),
+ aes(Year, imdbRating,label=paste(paste(paste(Name, "("), Year), ")")))
+```
+
+We next test four different models for predicting the rating and revenue of the next Bond movie. The first two models are very simple: model 1 just uses the rating/revenue of the previous movie as the predictor, while model 2 uses a linear model based on the rating/revenue of the previous movie, with the model parameters estimated from all the observations in the pairs of movies dataset, with Bond movies excluded. The next two models use information about the Bond actor. In particular, model 3 uses the rating/revenue of the previous movie with the same Bond actor, and uses the average over all previous movies if such a movie doesn't exist. Model 4 does the same thing, but instead uses the average of all previous movies with the same Bond actor.
+
+We compare the mean square error (MSE) and mean absolute deviation (MAD) for predicting movies 2 through 23 in the series. For rating prediction, model 4 gives the best accuracy both in terms of MSE and MAD. For predicting revenue, model 1 gives lowest MSE, while model 2 gives lowest MAD. We conclude that for predicting revenue the Bond actor is not as important as the previous movie in general.
+
+```{r, echo=F, results="hide"}
+# Predict rating
+
+# Model 1
+rating = bonds[2:24,]
+
+# Just use previous movie rating
+rating$mod1 = bonds$imdbRating[1:23]
+
+# Use regression for prediction
+rating$mod2 = 1
+mp_nobonds = mpairs[series != "James Bond",]
+reg1 = lm(imdbRating2 ~ imdbRating, data = mp_nobonds)
+
+for (i in 1:23) {
+	rating$mod2[i] = reg1$coefficients[1] + 
+	reg1$coefficients[2] * bonds$imdbRating[i]
+}
+
+# Use previuos movie with the same actor rating otherwise average
+# of all previous bonds
+rating$mod3 = 1
+for (i in 1:23 ) {
+	sub1 = subset(bonds[1:i,], James.Bond == bonds$James.Bond[i+1])
+	if (nrow(sub1) > 0){
+		rating$mod3[i] = sub1$imdbRating[nrow(sub1)]
+	} else {
+		rating$mod3[i] = mean(bonds$imdbRating[1:i])
+	}
+}
+
+# Use average of previous bonds with same actor rating otherwise
+# average of all previous bonds
+rating$mod4 = 1
+
+for (i in 1:23) {
+	sub1 = subset(bonds[1:i,], James.Bond == bonds$James.Bond[i+1])
+	if (nrow(sub1) > 0){
+		rating$mod4[i] = mean(sub1$imdbRating)
+	} else {
+		rating$mod4[i] = mean(bonds$imdbRating[1:i])
+	}
+}
+
+mean((rating$mod1 - rating$imdbRating)^2) # 0.4769565 
+mean((rating$mod2 - rating$imdbRating)^2) # 0.5169255
+mean((rating$mod3 - rating$imdbRating)^2) # 0.3829251
+mean((rating$mod4 - rating$imdbRating)^2) # 0.3193117
+
+mat1 = matrix(0, 23, 5)
+mat1[,1] = rating$imdbRating
+mat1[,2] = rating$mod1
+mat1[,3] = rating$mod2
+mat1[,4] = rating$mod3
+mat1[,5] = rating$mod4
+
+# Prediction for No Time to Die
+pred1 = bonds$imdbRating[24]
+pred2 = reg1$coefficients[1] + reg1$coefficients[2] * bonds$imdbRating[24]
+sub1 = subset(bonds[1:24,], James.Bond == bonds$James.Bond[24])
+pred3 = sub1$imdbRating[nrow(sub1)]
+pred4 = mean(sub1$imdbRating)
+
+pred_vals = matrix(0, 1, 4)
+pred_vals[1, 1] = pred1 # 6.8
+pred_vals[1, 2] = pred2 # 6.394434
+pred_vals[1, 3] = pred3 # 6.8
+pred_vals[1, 4] = pred4 # 7.325
+```
+
+
+```{r, echo=F, results="hide"}
+# Predict revenue
+rating = bonds[2:24,]
+
+# Just use previous movie rating
+rating$mod1 = bonds$Domestic[1:23]
+
+# Use regression for prediction
+rating$mod2 = 1
+reg1 = lm(domestic2 ~ domestic, data = mp_nobonds)
+
+for (i in 1:23) {
+	rating$mod2[i] = reg1$coefficients[1] + 
+	reg1$coefficients[2] * bonds$Domestic[i]
+}
+
+# Use previuos movie with the same actor rating otherwise average
+# of all previous bonds
+rating$mod3 = 1
+for (i in 1:23) {
+	sub1 = subset(bonds[1:i,], James.Bond == bonds$James.Bond[i+1])
+	if (nrow(sub1) > 0){
+		rating$mod3[i] = sub1$Domestic[nrow(sub1)]
+	} else {
+		rating$mod3[i] = mean(bonds$Domestic[1:i])
+	}
+}
+
+# Use average of previous bonds with same actor rating otherwise
+# average of all previous bonds
+rating$mod4 = 1
+
+for (i in 1:23 ) {
+	sub1 = subset(bonds[1:i,], James.Bond == bonds$James.Bond[i+1])
+	if (nrow(sub1) > 0){
+		rating$mod4[i] = mean(sub1$Domestic)
+	} else {
+		rating$mod4[i] = mean(bonds$Domestic[1:i])
+	}
+}
+
+mean((rating$mod1 - rating$Domestic)^2) # 1.437602e+16
+mean((rating$mod2 - rating$Domestic)^2) # 1.322785e+16
+mean((rating$mod3 - rating$Domestic)^2) # 1.636733e+16
+mean((rating$mod4 - rating$Domestic)^2) # 1.698644e+16
+
+mat1 = matrix(0, 23, 5)
+mat1[,1] = rating$Domestic
+mat1[,2] = rating$mod1
+mat1[,3] = rating$mod2
+mat1[,4] = rating$mod3
+mat1[,5] = rating$mod4
+
+# prediction
+pred1 = bonds$Domestic[24]
+pred2 = reg1$coefficients[1] + 
+reg1$coefficients[2] * bonds$Domestic[24]
+sub1 = subset(bonds[1:24,], James.Bond == bonds$James.Bond[24])
+pred3 = sub1$Domestic[nrow(sub1)]
+pred4 = mean(sub1$Domestic)
+
+pred_vals = matrix(0, 1, 4)
+pred_vals[1, 1] = pred1
+pred_vals[1, 2] = pred2
+pred_vals[1, 3] = pred3
+pred_vals[1, 4] = pred4
+# 200074609 165826670 200074609 229894302
+```
+
+Our models can be used to give some insight about the upcoming Bond movie \textit{No Time to Die}, to be released in April 2020. Models 1 through 3 predict a rating between 6.4 to 6.8, while model 4 gives a high rating of 7.325), and a good box office result (models 1 and 3 predict a revenue of $200 MM, model 4 gives $230 MM). While domestic revenue looks good, it may not be great in comparison to the rumored production budget of $250 MM^[https://www.imdb.com/title/tt2382320/].
+
+# Case Study: Movie Franchise Reboots
+
+Reboots (or remakes) allow filmmakers to reset the story, offering them much more freedom to create new stories and perspectives, revive characters, and replace actors with a new cast. We would like to understand what drives their decisions to reboot a series instead of continuing with a sequel. From our data set, we identify 11 series that have been rebooted at least once by checking their Wikipedia pages. They are: \textit{Batman, Home Alone, Hulk, The Muppets, Planet of the Apes, Spider-Man, Star Trek, Superman, Exorcist, James Bond}, and \textit{The Texas Chainsaw Massacre}. We exclude the last three from our analysis due to absence of information such as production budget. From now on, we will refer to a series of movies that follow the same storyline as "a reboot". We measure a film's success by its IMDb rating, domestic revenue, and return on investment (defined as Revenue-Budget).
+
+```{r, echo=F, results="hide"}
+# Reboots
+reboots <- read.csv("data-reboots.csv")
+reboots[is.na(reboots)] <- 0
+reboots <- subset(reboots, Series != "James Bond" & Series != "The Texas Chain Saw Massacre" & Series != "The Exorcist") # These franchises have weird data on revenue and production budget.
+reboots <- data.table(reboots)
+
+reboots$Series <- factor(reboots$Series)
+reboots$RebootIndex <- as.factor(reboots$RebootIndex)
+reboots$Released <- as.Date(reboots$Released, format = "%m/%d/%y")
+reboots[rownames(reboots)==37, ]$Released <- "1968-04-03"
+reboots$Released <- as.Date(reboots$Released)
+reboots$ROI <- (reboots$Worldwide - reboots$Production.Budget)/reboots$Production.Budget
+
+# Average ROI for each reboot
+tapply(reboots$ROI, list(reboots$Series, reboots$RebootIndex), mean)
+
+# Average imdbRating
+tapply(reboots$imdbRating, list(reboots$Series, reboots$RebootIndex), mean)
+
+# Statistics
+tapply(reboots$RebootLength, reboots$Series, max) # how many reboots
+tapply(reboots$NumInReboot, reboots$RebootLength, mean)
+# average number of movies in each reboot when having 'x' reboots
+
+# Make subsets for each series
+batman <- subset(reboots, Series == "Batman")
+homealone <- subset(reboots, Series == "Home Alone")
+hulk <- subset(reboots, Series == "Hulk")
+apes <- subset(reboots, Series == "Planet of the Apes")
+spiderman <- subset(reboots, Series == "Spider-Man")
+startrek <- subset(reboots, Series == "Star Trek")
+superman <- subset(reboots, Series == "Superman")
+muppets <- subset(reboots, Series == "The Muppets")
+
+ggplot(data = reboots, aes(x = NumInSeries, y=Domestic, color = Series, shape=RebootIndex)) + geom_point() + geom_line(data = batman, aes(x = NumInSeries, y=Domestic, color = Series, linetype = RebootIndex)) + geom_line(data = homealone, aes(x = NumInSeries, y=Domestic, color = Series, linetype = RebootIndex))  + geom_line(data = hulk, aes(x = NumInSeries, y=Domestic, color = Series, linetype = RebootIndex))  + geom_line(data = apes, aes(x = NumInSeries, y=Domestic, color = Series, linetype = RebootIndex))  + geom_line(data = spiderman, aes(x = NumInSeries, y=Domestic, color = Series, linetype = RebootIndex))  + geom_line(data = startrek, aes(x = NumInSeries, y=Domestic, color = Series, linetype = RebootIndex))  + geom_line(data = superman, aes(x = NumInSeries, y=Domestic, color = Series, linetype = RebootIndex))  + geom_line(data = muppets, aes(x = NumInSeries, y=Domestic, color = Series, linetype = RebootIndex))  + ggtitle("Reboot Movies: Domestic Revenue Trend") + xlab("# in Series") + ylab("Domestic Revenue") + theme(legend.position="bottom") + geom_text(size=2.5, vjust= -1.5, hjust = 0.3, data=subset(reboots, NumInReboot == 1), aes(NumInSeries, Domestic,label=paste(paste(paste(Series, "("), RebootIndex), ")")))
+
+ggplot(data = reboots, aes(x = NumInSeries, y=Worldwide, color = Series, shape=RebootIndex)) + geom_point() + geom_line(data = batman, aes(x = NumInSeries, y=Worldwide, color = Series, linetype = RebootIndex)) + geom_line(data = homealone, aes(x = NumInSeries, y=Worldwide, color = Series, linetype = RebootIndex))  + geom_line(data = hulk, aes(x = NumInSeries, y=Worldwide, color = Series, linetype = RebootIndex))  + geom_line(data = apes, aes(x = NumInSeries, y=Worldwide, color = Series, linetype = RebootIndex))  + geom_line(data = spiderman, aes(x = NumInSeries, y=Worldwide, color = Series, linetype = RebootIndex))  + geom_line(data = startrek, aes(x = NumInSeries, y=Worldwide, color = Series, linetype = RebootIndex))  + geom_line(data = superman, aes(x = NumInSeries, y=Worldwide, color = Series, linetype = RebootIndex))  + geom_line(data = muppets, aes(x = NumInSeries, y=Worldwide, color = Series, linetype = RebootIndex))  + ggtitle("Reboot Movies: Worldwide Revenue Trend") + xlab("# in Series") + ylab("Worldwide Revenue") + theme(legend.position="bottom") + geom_text(size=2.5, vjust= -1.5, hjust = 0.3, data=subset(reboots, NumInReboot == 1), aes(NumInSeries, Worldwide,label=paste(paste(paste(Series, "("), RebootIndex), ")")))
+```
+
+We posit that filmmakers choose to reboot a series because a new reboot will gain better rating and/or higher revenue. From our data set, new reboots have a better IMDb rating 81.8% of the time and earn a higher revenue 63.6% of the time than previous one, and the average changes in rating and revenue are +1.1 and +$29 MM, respectively. As we observe the declining trend for each measure, we decide to use the trend (`slope`), estimated from linear regression of each measure on the index of each movie in a reboot (`NumInSeries`) to forecast new reboot's success. New data set is generated such that each observation is a pair of two consecutive reboots with trends (slopes) for ratings and revenues, ratings and revenues for the first and the last movies in each reboot, and the released year difference. We consider three basic models: 1) only use previous rating/revenue trend, 2) use previous rating/revenue trend and rating/revenue of the last movie in previous reboot, and 3) same as 2) but include difference in released years. We build these models using the training set and test them on out-of-sample test set. Similar to the Bond's case study, the prediction accuracy is compared using MSE and MAD.
+
+```{r, echo=F, results="hide"}
+# Reboot
+
+# Helper functions
+specify_decimal <- function(x, k) as.numeric(format(round(x, k), nsmall=k))
+predictReboot <- function(currentData) { 
+  currentData$NumInSeries <- 1:nrow(currentData)
+  Rating1 <- currentData[nrow(currentData)-1,]$imdbRating
+  Rating2 <- currentData[nrow(currentData),]$imdbRating
+  RatingMean <- mean(currentData[nrow(currentData)-1,]$imdbRating)
+  Domestic1 <- currentData[nrow(currentData)-1,]$domestic
+  Domestic2 <- currentData[nrow(currentData),]$domestic
+  DomesticMean <- mean(currentData[nrow(currentData)-1,]$domestic)
+  tempModel <- lm(imdbRating ~ NumInSeries, currentData[1:nrow(currentData)-1,])
+  RatingSlope <- tempModel$coefficients[[2]]
+  tempModel2 <- lm(domestic ~ NumInSeries, currentData[1:nrow(currentData)-1,])
+  DomesticSlope <- tempModel2$coefficients[[2]]
+  YearDiff <- currentData[nrow(currentData),]$year - currentData[nrow(currentData)-1,]$year
+
+  ToPredict <- data.frame(Rating1 = Rating1, Rating2 = Rating2, RatingMean = RatingMean, RatingSlope = RatingSlope, Domestic1 = Domestic1, Domestic2 = Domestic2, DomesticMean = DomesticMean, DomesticSlope = DomesticSlope, YearDiff = YearDiff)
+
+  # Make Predictions
+  predCurrent <- matrix(0, nrow = 2, ncol = 6)
+  predCurrent[1,1] <- ToPredict$Rating2 # rating
+  predCurrent[2,1] <- ToPredict$Domestic2/(10^6) # revenue
+  
+  predCurrent[1,2] <- predict(model0, ToPredict)
+  predCurrent[1,3] <- predict(model1, ToPredict)
+  predCurrent[1,4] <- predict(model2, ToPredict)
+  predCurrent[1,5] <- predict(model3, ToPredict)
+  predCurrent[2,2] <- predict(model02, ToPredict)/(10^6)
+  predCurrent[2,3] <- predict(model12, ToPredict)/(10^6)
+  predCurrent[2,4] <- predict(model22, ToPredict)/(10^6)
+  predCurrent[2,5] <- predict(model32, ToPredict)/(10^6)
+  predCurrent[1,6] <- RatingSlope
+  predCurrent[2,6] <- DomesticSlope/(10^6)
+  return(predCurrent)
+}
+
+predictNextReboots = function(currentData, yd) {
+  currentData$NumInSeries <- 1:nrow(currentData)
+  Rating1 <- currentData[nrow(currentData),]$imdbRating
+  RatingMean <- mean(currentData[nrow(currentData),]$imdbRating)
+  Domestic1 <- currentData[nrow(currentData),]$domestic
+  DomesticMean <- mean(currentData[nrow(currentData),]$domestic)
+  tempModel <- lm(imdbRating ~ NumInSeries, currentData)
+  RatingSlope <- tempModel$coefficients[[2]]
+  tempModel2 <- lm(domestic ~ NumInSeries, currentData)
+  DomesticSlope <- tempModel2$coefficients[[2]]
+  YearDiff <- yd
+
+  ToPredict <- data.frame(Rating1 = Rating1, RatingMean = RatingMean, RatingSlope = RatingSlope, Domestic1 = Domestic1, DomesticMean = DomesticMean, DomesticSlope = DomesticSlope, YearDiff = YearDiff)
+
+# Make Predictions
+  predCurrent <- matrix(0, nrow = 2, ncol = 6)
+  predCurrent[1,1] <- specify_decimal(Rating1 + RatingSlope, 1) # if sequel
+  predCurrent[2,1] <- specify_decimal((Domestic1 + DomesticSlope)/(10^6), 2) # if sequel
+  predCurrent[1,2] <- specify_decimal(predict(model0, ToPredict), 1)
+  predCurrent[1,3] <- specify_decimal(predict(model1, ToPredict), 1)
+  predCurrent[1,4] <- specify_decimal(predict(model2, ToPredict), 1)
+  #predCurrent[1,5] <- specify_decimal(predict(model3, ToPredict), 1)
+  predCurrent[2,2] <- specify_decimal(predict(model02, ToPredict)/(10^6), 2)
+  predCurrent[2,3] <- specify_decimal(predict(model12, ToPredict)/(10^6), 2)
+  predCurrent[2,4] <- specify_decimal(predict(model22, ToPredict)/(10^6), 2)
+  #predCurrent[2,5] <- specify_decimal(predict(model32, ToPredict)/(10^6), 2)
+  predCurrent[1,5] <- specify_decimal(RatingSlope, 2)
+  predCurrent[2,5] <- specify_decimal(DomesticSlope/(10^6), 2)
+  
+  predCurrent[1,6] <- ifelse(predCurrent[1,1] >=  predCurrent[1,3], "Sequel", "Reboot")
+  predCurrent[2,6] <- ifelse(Domestic1 + DomesticSlope >=  predict(model02, ToPredict), "Sequel", "Reboot") 
+
+  print(toString(unique(currentData$Series)))
+
+  return(predCurrent)
+}
+
+# Look at the change
+reboots.change <- read.csv("data-rebootschange.csv")
+str(reboots.change)
+colMeans(reboots.change[,c(4,8,12)])
+table(reboots.change$DomesticDiff>0)
+table(reboots.change$ROIDiff>0)
+table(reboots.change$RatingDiff>0)
+
+# Calculate slope
+# imdb
+reg1 <- lm(imdbRating ~ NumInReboot, subset(superman, RebootIndex == 1))
+summary(reg1) # -1.27
+
+reg1 <- lm(imdbRating ~ NumInReboot, subset(homealone, RebootIndex == 1))
+summary(reg1) # -0.-9
+
+reg1 <- lm(imdbRating ~ NumInReboot, subset(batman, RebootIndex == 1))
+summary(reg1) # -0.96
+
+reg1 <- lm(imdbRating ~ NumInReboot, subset(spiderman, RebootIndex == 1))
+summary(reg1) # -0.55
+
+reg1 <- lm(imdbRating ~ NumInReboot, subset(muppets, RebootIndex == 1))
+summary(reg1) # -0.2171
+
+reg1 <- lm(imdbRating ~ NumInReboot, subset(apes, RebootIndex == 1))
+summary(reg1) # -0.51
+
+reg1 <- lm(imdbRating ~ NumInReboot, subset(startrek, RebootIndex == 1))
+summary(reg1) # -0.07143
+
+reg1 <- lm(imdbRating ~ NumInReboot, subset(startrek, RebootIndex == 2))
+summary(reg1) # -0.18
+
+# Domestic
+reg1 <- lm(Domestic ~ NumInReboot, subset(superman, RebootIndex == 1))
+reg1 <- lm(Domestic ~ NumInReboot, subset(homealone, RebootIndex == 1))
+reg1 <- lm(Domestic ~ NumInReboot, subset(batman, RebootIndex == 1))
+reg1 <- lm(Domestic ~ NumInReboot, subset(spiderman, RebootIndex == 1))
+reg1 <- lm(Domestic ~ NumInReboot, subset(muppets, RebootIndex == 1))
+reg1 <- lm(Domestic ~ NumInReboot, subset(apes, RebootIndex == 1))
+reg1 <- lm(Domestic ~ NumInReboot, subset(startrek, RebootIndex == 1))
+reg1 <- lm(Domestic ~ NumInReboot, subset(startrek, RebootIndex == 2))
+summary(reg1)
+
+# ROI
+reg1 <- lm(ROI ~ NumInReboot, subset(superman, RebootIndex == 1))
+reg1 <- lm(ROI ~ NumInReboot, subset(homealone, RebootIndex == 1))
+reg1 <- lm(ROI ~ NumInReboot, subset(batman, RebootIndex == 1))
+reg1 <- lm(ROI ~ NumInReboot, subset(spiderman, RebootIndex == 1))
+reg1 <- lm(ROI ~ NumInReboot, subset(muppets, RebootIndex == 1))
+reg1 <- lm(ROI ~ NumInReboot, subset(apes, RebootIndex == 1))
+reg1 <- lm(ROI ~ NumInReboot, subset(startrek, RebootIndex == 1))
+reg1 <- lm(ROI ~ NumInReboot, subset(startrek, RebootIndex == 2))
+summary(reg1)
+
+# Compare max and latest rating
+# compareRating <- subset(reboots, RebootIndex == 1 | (RebootIndex == 2 & Series == "Star Trek"))
+# tapply(compareRating$imdbRating, list(compareRating$Series, compareRating$RebootIndex), max)
+# tapply(compareRating$imdbRating, list(compareRating$Series, compareRating$RebootIndex), min)
+
+# Prediction - rating of new movie
+# Model 1 - rating/revenue of the last one + yearsDiff
+reboot.slope <- read.csv("data-rebootsslope.csv")
+mean(reboot.slope$YearDiff) # 9.91 years apart
+
+set.seed(17)
+spl = sample.split(reboot.slope$Rating2, SplitRatio = 0.7)
+pairsTrain = subset(reboot.slope, spl==TRUE)
+pairsTest = subset(reboot.slope, spl==FALSE)
+
+set.seed(17)
+spl2 = sample.split(reboot.slope$Domestic2, SplitRatio = 0.7)
+pairsTrain2 = subset(reboot.slope, spl2==TRUE)
+pairsTest2 = subset(reboot.slope, spl2==FALSE)
+
+model0 <- lm(Rating2 ~ RatingSlope, pairsTrain)
+model02 <- lm(Domestic2 ~ DomesticSlope, pairsTrain2)
+
+# Model 1 - raiting/revenue of the last one + slope
+model1 <- lm(Rating2 ~ Rating1 + RatingSlope, pairsTrain)
+model12 <- lm(Domestic2 ~ Domestic1 + DomesticSlope, pairsTrain2)
+
+# Model 2 - rating/revenue of the last one, + slope of the declining rating + year diff
+model2 <- lm(Rating2 ~ Rating1 + RatingSlope + YearDiff, pairsTrain)
+model22 <- lm(Domestic2 ~ Domestic1 + DomesticSlope + YearDiff, pairsTrain2)
+
+# Model 3 - average rating/revenue for the previous movies
+model3 <- lm(Rating2 ~ Rating1 + RatingMean + RatingSlope + YearDiff, pairsTrain)
+model32 <- lm(Domestic2 ~ Domestic1 + DomesticMean + DomesticSlope + YearDiff, pairsTrain2)
+
+# IMDB
+c(summary(model0)$r.squared, summary(model1)$r.squared, summary(model2)$r.squared, summary(model3)$r.squared)
+c(summary(model0)$adj.r.squared, summary(model1)$adj.r.squared, summary(model2)$adj.r.squared, summary(model3)$adj.r.squared)
+
+# Revenue
+c(summary(model02)$r.squared, summary(model12)$r.squared, summary(model22)$r.squared, summary(model32)$r.squared)
+c(summary(model02)$adj.r.squared, summary(model12)$adj.r.squared, summary(model22)$adj.r.squared, summary(model32)$adj.r.squared)
+
+# Predict on testing set
+pred0 <- predict(model0, pairsTest)
+pred1 <- predict(model1, pairsTest)
+pred2 <- predict(model2, pairsTest)
+pred3 <- predict(model3, pairsTest)
+pred02 <- predict(model02, pairsTest2)
+pred12 <- predict(model12, pairsTest2)
+pred22 <- predict(model22, pairsTest2)
+pred32 <- predict(model32, pairsTest2)
+
+# mse(model0$fitted.values, pairsTrain$Rating2) # 0.1596378
+# mse(model1$fitted.values, pairsTrain$Rating2) # 0.1415953
+# mse(model2$fitted.values, pairsTrain$Rating2) # 0.1212401
+# mse(model3$fitted.values, pairsTrain$Rating2) # 0.1138606
+
+c(mse(pred0, pairsTest$Rating2), mse(pred1, pairsTest$Rating2), mse(pred2, pairsTest$Rating2), mse(pred3, pairsTest$Rating2))
+
+c(mse(pred02, pairsTest$Domestic2), mse(pred12, pairsTest$Domestic2), mse(pred22, pairsTest$Domestic2), mse(pred32, pairsTest$Domestic2))
+
+c(mean(abs(pred0 - pairsTest$Rating2)), mean(abs(pred1 - pairsTest$Rating2)), mean(abs(pred2 - pairsTest$Rating2)), mean(abs(pred3 - pairsTest$Rating2)))
+
+c(mean(abs(pred02 - pairsTest$Domestic2)), mean(abs(pred12 - pairsTest$Domestic2)), mean(abs(pred22 - pairsTest$Domestic2)), mean(abs(pred32 - pairsTest$Domestic2)))
+
+# Perform prediction
+# Case-Study: Godfather, Indiana Jones, Jason Bourne, Transformers, Underworld, Die Hard, Mission: Impossible, Pirates of the Caribbean, Terminator, The Fast and the Furious, Saw
+mpairsRB <- read.csv("data-series.csv")
+#mpairsRB <- subset(mpairsRB, Series == "Fantastic Four" | Series == "Godfather" | Series == "Indiana Jones" | Series == "Jason Bourne" | Series == "Transformers" | Series == "Underworld" | Series == "Die Hard" | Series == "Mission: Impossible" | Series == "Pirates of the Caribbean" | Series == "Terminator" | Series == "The Fast and the Furious" | Series == "Saw" | Series == "Transporter")
+
+mpairsRB[is.na(mpairsRB)] <- 0
+mpairsRB <- mpairsRB[,c("series","title","domestic", "imdbRating", "year")]
+
+fantastic <- subset(mpairsRB, series == "Fantastic Four")
+transporter <- subset(mpairsRB, series == "Transporter")
+indiana <- subset(mpairsRB, series == "Indiana Jones")
+godfather <- subset(mpairsRB, series == "The Godfather")
+bourne <- subset(mpairsRB, series == "Jason Bourne")
+terminator <- subset(mpairsRB, series == "Terminator")
+pirates <- subset(mpairsRB, series == "Pirates of the Caribbean")
+diehard <- subset(mpairsRB, series == "Die Hard")
+transformers <- subset(mpairsRB, series == "Transformers")
+saw <- subset(mpairsRB, series == "Saw")
+fastfurious <- subset(mpairsRB, series == "Fast and Furious")
+missimp <-subset(mpairsRB, series == "Mission: Impossible")
+underworld <- subset(mpairsRB, series == "Underworld")
+
+# Prediction
+# predictReboot(indiana)
+predictNextReboots(fantastic, 2)
+predictNextReboots(indiana, 2)
+predictNextReboots(godfather, 2)
+predictNextReboots(bourne, 2)
+predictNextReboots(terminator, 2)
+predictNextReboots(pirates, 2)
+predictNextReboots(diehard, 2)
+predictNextReboots(transformers, 2)
+predictNextReboots(saw, 2)
+predictNextReboots(missimp, 2)
+predictNextReboots(underworld, 2)
+predictNextReboots(indiana, 5)
+predictNextReboots(godfather, 5)
+predictNextReboots(bourne, 5)
+predictNextReboots(terminator, 5)
+predictNextReboots(pirates, 5)
+predictNextReboots(diehard, 5)
+predictNextReboots(transformers, 5)
+predictNextReboots(saw, 5)
+predictNextReboots(missimp, 5)
+predictNextReboots(underworld, 5)
+
+predictedReboots <- as.data.frame(rbind(predictNextReboots(indiana, 2),
+predictNextReboots(godfather, 2),
+predictNextReboots(bourne, 2),
+predictNextReboots(terminator, 2),
+predictNextReboots(pirates, 2),
+predictNextReboots(diehard, 2),
+predictNextReboots(transformers, 2),
+predictNextReboots(saw, 2),
+predictNextReboots(missimp, 2),
+predictNextReboots(underworld, 2),
+predictNextReboots(indiana, 5),
+predictNextReboots(godfather, 5),
+predictNextReboots(bourne, 5),
+predictNextReboots(terminator, 5),
+predictNextReboots(pirates, 5),
+predictNextReboots(diehard, 5),
+predictNextReboots(transformers, 5),
+predictNextReboots(saw, 5),
+predictNextReboots(missimp, 5),
+predictNextReboots(underworld, 5)))
+
+# Predict sequel and reboot for all movies in the data
+for (mname in unique(mpairsRB$series)) {
+  print(predictNextReboots(subset(mpairsRB, series == mname), 5))
+}
+
+```
+
+To illustrate the performance of our models, we consider two movie series: `Fast and Furious` and `Transporter`.  By 2013, there were 6 Fast and Furious movies. They waited 2 years until releasing the next movie, Furious 7 in 2015. Our models suggest that, by making a sequel rather than a reboot, Furious 7 would enjoy a higher rating and revenue. The first column displays the predicted rating and revenue if sequel, while columns 2 through 4 displays the predicted rating and revenue if reboots using three different models. This turned out to be true as Furious 7 received an iMDB rating of 7.2 and made a box office of 1.516 billion USD.
+
+```{r, echo=F}
+predictNextReboots(fastfurious, 2)
+```
+
+On the other hand, The Transporter Trilogy comprises 3 films released between 2002 and 2008, starring Jason Statham, an accomplished martial artist, who did all Hong Kong-style fight scenes himself. They waited 7 years to release a new film. Our models predicted that making a reboot is better for both rating and revenue. This also turned out to be the case as `The Transporter: Refueled` was released in 2015 as a reboot. The actual iMDB rating is 5.2 and the revenue is 72 million USD.
+
+```{r, echo=F}
+predictNextReboots(transporter, 7)
+```
+
+## Recommendations for Future Sequels and Reboots
+
+We compare our results (estimated rating and revenue of a new reboot) with a forecast of a new sequel, which is calculated differently that our main rating/revenue predictive models described earlier in the report. The slope (coefficient of NumInSeries) used to predict a new reboot is also used to estimate a sequel. To illustrate our methodology, consider Reboot 1 of Batman which contains five movies. Using NumIn- Series as a regressor, we can use the estimated coefficient (slope) to compute rating/revenue of the sixth movie that follows the same storyline (sequel). Then using this slope and other characteristics we include in the three different models, we can predict rating/revenue of the sixth movie which is actually the first movie of Reboot 2. Due to a very small size of data set, we do understand that our simple models will not be able to give very accurate predictions. However, we believe that this finding can lead to potential sophisticated models to assist filmmakers in deciding the series’ future directions.
+
+Running the models on the movies that have never been rebooted, we achieve four kinds of recommendations.
+
+* Definitely Reboot - Rebooting these series will lead to better rating and higher revenue than making a sequel: `Matrix`, `Terminator`, `Transformers`, `Men in Black`, `Indiana Jones`, `Charlie’s Angels`, `Ice Age`, `Mummy.`
+* Definitely Sequel - Making a sequel for these series will lead to better rating and higher revenue than rebooting them: `Star Wars`, `Despicable Me`, `Thor`, `Madagascar`, `Harry Potter`, `X-Men`, `Captain America`.
+* Reboot for Rating, Sequel for Revenue - Rebooting these series will lead to better rating, but lower revenue than making a sequel: `National Treasure`, `SpongeBob SquarePants`, `Tron`, `Twilight Saga`, `Hunger Games`, `Iron Man`, `Austin Powers`.
+* Sequel for Rating, Reboot for Revenue - Rebooting these series will lead to worse rating, but higher revenue than making a sequel: `Kill Bill`, `Sherlock Holmes`, `Jackass`, `Hulk`, `How to Train Your Dragon`, `Hellboy`, `The Purge`.
+
+# Text Mining Analysis
+
+```{r, echo=F, results="hide"}
+text.data <- read.csv("unique_data.csv", 
+                      header = T, na.strings = c("?", ""))
+
+data1.plot <- text.data$plot
+
+tst1 <- VectorSource(data1.plot)
+mycorpus1 <- VCorpus(VectorSource(data1.plot))
+mycorpus_clean <- tm_map(mycorpus1, content_transformer(tolower))
+mycorpus_clean <- tm_map(mycorpus_clean, removeWords, stopwords("english"))
+mycorpus_clean <- tm_map(mycorpus_clean, removePunctuation)
+mycorpus_clean <- tm_map(mycorpus_clean, removeNumbers)
+mycorpus_clean <- tm_map(mycorpus_clean, stemDocument, lazy = TRUE)
+
+dtm1 <- DocumentTermMatrix(mycorpus_clean)
+#dtm1
+
+threshold <- 0.005*length(mycorpus_clean)
+words.10 <- findFreqTerms(dtm1, lowfreq=threshold)
+
+dtm.10 <- DocumentTermMatrix(mycorpus_clean, control = list(dictionary=words.10))
+data1.temp <- data.frame(text.data, as.matrix(dtm.10))
+
+
+rating <- rep(0, 475)
+
+for(i in 1:475){
+  stars = data1.temp$imdbRating[i]
+  if (stars>=6.6){
+    rating[i] <- 1
+  }
+  else {
+    next
+  }
+}
+
+data1.temp$rating <- rating
+
+data2 <- data1.temp[,c(783, 42:782)]
+data2$rating <- as.factor(data2$rating)
+
+set.seed(1)
+n <- nrow(data2)
+tt.index <- sample(n, 400)
+data2.tt <- data2[tt.index,]
+data2.valid <- data2[-tt.index,]
+data2.test <- data2[tt.index[1:80],]
+data2.train <- data2[tt.index[81:400],]
+
+y <- data2.train$rating
+X <- as.matrix(data2.train[, -c(1)])
+X1 <- sparse.model.matrix(rating~., data=data2.train)[, -1]
+set.seed(2)
+
+result.lasso.1 <- cv.glmnet(X1, y, alpha=0.99, family="binomial")
+plot(result.lasso.1)
+
+#beta.lasso.1 <- coef(result.lasso.1, s="lambda.1se")
+#beta <- beta.lasso.1[which(beta.lasso.1 !=0),]
+#beta <- as.matrix(beta)
+#beta <- rownames(beta)
+
+#glm.input <- as.formula(paste("rating", "~", paste(beta[-1], collapse = "+")))
+#result.glm <- glm(glm.input, family=binomial, data2.train)
+#result.glm.coef <- coef(result.glm)
+#good.glm <- result.glm.coef[which(result.glm.coef>0)]
+#good.glm <- good.glm[-1]
+
+#cor.special <- brewer.pal(8, "Dark2")
+#good.fre <- sort(good.glm, decreasing = TRUE)
+#round(good.fre, 4)[1:2]
+
+```
+
+In the textual analysis, we transform the plot provided by imdbPro into a word frequency matrix. We transform the text into a more standard format and clean the text by removing punctuation, numbers and some common words that do not have predictive power. (In analyzing the plots, we use unique 475 movies, as opposed to the "sets" of movies in other analyses.) We cut the bag to only include the words appearing at least 0.5% of the time to reduce the dimension of the features extracted to be analyzed. In other words, sparsity is 0.995 (or less). This means we keep words that appear at least once in 0.5% of documents. The plots contain neutral words as opposed to the reviews provided by the reviewers. Therefore, as opposed to the sentiment analysis from the reviews, it is unlikely that the plots provide words with significantly positive or negative sentiment. As expected, from relaxed LASSO analysis, we find that none of the words in the plots provide positive or negative tones of the words. In other words, the statistically significant predictor is null, as can be observed in the above figure (both in "lambda.min" and "lambda.1se").
+
+
+# Conclusions
+
+In conclusion, we have built models to predict the IMDb rating and domestic revenue of the next movie in a series based on the known characteristics of the movie before release and the characteristics of the movie right before it. For predicting rating, multinomial LASSO regression performs well with an accuracy of 47% on the test set, significantly better than baseline accuracy. From the classification tree model fit to the data using cross-validation, we find that subsequent movies in a series have a lower rating, with the drop in rating predicted to be larger if the previous movie in the series had a lower rating. Both classification tree and random forest models performs best with an out-of-sample accurcy of 49.52%. When it comes to revenue, classification tree again performs best among the three different prediction approaches, yielding a 53.33% accuracy.
+
+We perform a detailed analysis of the James Bond movie franchise. Movies with the same Bond actor have a similar rating, and the average of all previous movies with the same Bond actor is a good predictor for the rating of the next Bond movie. This result does not hold as well for revenue, and just using the data on the previous movie is better. We predict that the upcoming movie No Time to Die will be of high quality and earn a high revenue, but possibly not too high after considering its large production budget.
+
+Further, we take a look at movie franchise reboots. These situations are different because with a reboot the main storyline and often the main cast are completely reset. To predict the rating of the next reboot it is best to use the linear model containing the previous movie together with the trend in previous reboot. To predict the revenue, using just the trend in the previous reboot is better. We are able to apply these models to make predictions on which existing movie series should be followed by a sequel or a reboot.
+
+Finally, we conduct textual analysis of the plots provided by the movie providers. As opposed to the reviews from the reviewers, the narrative descriptions of the plots show that there is no predictive word on positive or negative ratings. This is consistent with our intuition that the plots are often described in a neutral way.
+
+There are a few potential extensions of our analysis. If we obtain a dataset that also includes "stand-alone" movies, we would be able to compare by how much predictability improves for a movie that is part of a series than for a stand-alone movie – since for a movie in a series we can use information on the previous movies. It would also be nice to use the past "performance" of the movie director as a predictor, for example, the average of rating or revenue of all big movies produced by the same director. Furthermore, we would want to think about how to use production budget data more effectively to hopefully get more accurate models incorporating this variable more effectively.
+
+
+# Appendix:
+
+## Data Scraping
+In order to efficiently gather data, we scraped data from the imdb website using omdb. After extracting a list of movies we wanted to put in the dataset, we first had to manually retrieve the imdb movie codes. The list of movie codes is stored in 'movie_codes.csv'. In the first column, we have the first movie of the paired movies and in the second column, we have the second of the paired movies.
+
+Using the code below, we use these codes to form a more detailed data frame.
+For information about budget and revenue, we had to manually input the values because there was no API we could use.
+```{r, echo=TRUE, results="hide"}
+data1 <- read.csv('movie_codes.csv')
+imdb_codes <- as.character(data1$imdbID)
+imdb_codes2 <- as.character(data1$imdbID2)
+
+suburl <- "http://www.omdbapi.com/?apikey=72bc447a&i="
+suburl2 <- "&r=json"
+
+title <- c()
+year <- c()
+release <- c()
+rated <- c()
+r_runtime <- c()
+action <- c()
+adventure <- c()
+crime <- c()
+drama <- c()
+thriller <- c()
+documentary <- c()
+fantasy <- c()
+horror <- c()
+scifi <- c()
+war <- c()
+comedy <- c()
+family <- c()
+mystery <- c()
+romance <- c()
+animation <- c()
+music <- c()
+biography <- c()
+history <- c()
+short <- c()
+western <- c()
+language <- c()
+country <- c()
+awards <- c()
+imdbRating <- c()
+metascore <- c()
+r_rottenscore <- c()
+imdbVote <- c()
+imdbIDs <- c()
+plot <- c()
+boxoffice <- c()
+
+
+
+for (i in 1:length(imdb_codes)){
+  code <- imdb_codes[i]
+  finalurl <- paste(suburl, code, suburl2, sep="")
+  res <- fromJSON(finalurl)
+  title[i] <- res$Title
+  year[i] <- res$Year
+  release[i] <- res$Released
+  rated[i] <- res$Rated
+  r_runtime[i] <- res$Runtime
+  genre <- res$Genre
+  action[i] <- grepl("Action", genre)
+  thriller[i] <- grepl("Thriller", genre)
+  documentary[i] <- grepl("Documentary", genre)
+  adventure[i] <- grepl("Adventure", genre)
+  crime[i] <- grepl("Crime", genre)
+  drama[i] <- grepl("Drama", genre)
+  fantasy[i] <- grepl("Fantasy", genre)
+  horror[i] <- grepl("Horror", genre)
+  scifi[i] <- grepl("Sci-Fi", genre)
+  war[i] <- grepl("War", genre)
+  comedy[i] <- grepl("Comedy", genre)
+  family[i] <- grepl("Family", genre)
+  mystery[i] <- grepl("Mystery", genre)
+  romance[i] <- grepl("Romance", genre)
+  animation[i] <- grepl("Animation", genre)
+  music[i] <- grepl("Music", genre)
+  biography[i] <- grepl("Biography", genre)
+  history[i] <- grepl("History", genre)
+  short[i] <- grepl("Short", genre)
+  western[i] <- grepl("Western", genre)
+  language[i] <- res$Language
+  country[i] <- res$Country
+  awards[i] <- res$Awards
+  rrrating <- res$Ratings[2][,1]
+  imdbRating[i] <- res$imdbRating
+  metascore[i] <- res$Metascore
+  r_rottenscore[i] <- rrrating[2]
+  imdbVote[i] <- res$imdbVotes
+  plot[i] <- res$Plot
+  boxoffice[i] <- res$BoxOffice
+  print(i)
+}
+
+inEnglish <- c()
+for (i in 1:length(language)){
+  lang <- language[i]
+  inEnglish[i] <- grepl("English", lang)
+}
+
+isUSA <- c()
+for (i in 1:length(country)){
+  count <- country[i]
+  isUSA[i] <- grepl("USA", count)
+}
+
+runtime <- as.integer(gsub('.{3}$', '', r_runtime))
+year <- as.numeric(year)
+imdbRating <- as.numeric(imdbRating)
+metascore <- as.numeric(metascore)
+rottenscore <- as.numeric(gsub('.{1}$', '', r_rottenscore))
+imdbVote <- gsub(",","",imdbVote)
+imdbVote <- as.numeric(imdbVote)
+
+#######
+
+title2 <- c()
+year2 <- c()
+release2 <- c()
+rated2 <- c()
+r_runtime2 <- c()
+action2 <- c()
+adventure2 <- c()
+crime2 <- c()
+drama2 <- c()
+thriller2 <- c()
+documentary2 <- c()
+fantasy2 <- c()
+horror2 <- c()
+scifi2 <- c()
+war2 <- c()
+comedy2 <- c()
+family2 <- c()
+mystery2 <- c()
+romance2 <- c()
+animation2 <- c()
+music2 <- c()
+biography2 <- c()
+history2 <- c()
+short2 <- c()
+western2 <- c()
+language2 <- c()
+country2 <- c()
+awards2 <- c()
+imdbRating2 <- c()
+metascore2 <- c()
+r_rottenscore2 <- c()
+imdbVote2 <- c()
+imdbIDs2 <- c()
+plot2 <- c()
+boxoffice2 <- c()
+
+
+
+for (i in 1:length(imdb_codes2)){
+  code <- imdb_codes2[i]
+  finalurl <- paste(suburl, code, suburl2, sep="")
+  res <- fromJSON(finalurl)
+  title2[i] <- res$Title
+  year2[i] <- res$Year
+  release2[i] <- res$Released
+  rated2[i] <- res$Rated
+  r_runtime2[i] <- res$Runtime
+  genre <- res$Genre
+  action2[i] <- grepl("Action", genre)
+  thriller2[i] <- grepl("Thriller", genre)
+  documentary2[i] <- grepl("Documentary", genre)
+  adventure2[i] <- grepl("Adventure", genre)
+  crime2[i] <- grepl("Crime", genre)
+  drama2[i] <- grepl("Drama", genre)
+  fantasy2[i] <- grepl("Fantasy", genre)
+  horror2[i] <- grepl("Horror", genre)
+  scifi2[i] <- grepl("Sci-Fi", genre)
+  war2[i] <- grepl("War", genre)
+  comedy2[i] <- grepl("Comedy", genre)
+  family2[i] <- grepl("Family", genre)
+  mystery2[i] <- grepl("Mystery", genre)
+  romance2[i] <- grepl("Romance", genre)
+  animation2[i] <- grepl("Animation", genre)
+  music2[i] <- grepl("Music", genre)
+  biography2[i] <- grepl("Biography", genre)
+  history2[i] <- grepl("History", genre)
+  short2[i] <- grepl("Short", genre)
+  western2[i] <- grepl("Western", genre)
+  language2[i] <- res$Language
+  country2[i] <- res$Country
+  awards2[i] <- res$Awards
+  rrrating <- res$Ratings[2][,1]
+  imdbRating2[i] <- res$imdbRating
+  metascore2[i] <- res$Metascore
+  r_rottenscore2[i] <- rrrating[2]
+  imdbVote2[i] <- res$imdbVotes
+  plot2[i] <- res$Plot
+  boxoffice2[i] <- res$BoxOffice
+  print(i)
+}
+
+inEnglish2 <- c()
+for (i in 1:length(language2)){
+  lang <- language2[i]
+  inEnglish2[i] <- grepl("English", lang)
+}
+
+isUSA2 <- c()
+for (i in 1:length(country2)){
+  count <- country2[i]
+  isUSA2[i] <- grepl("USA", count)
+}
+
+runtime2 <- as.integer(gsub('.{3}$', '', r_runtime2))
+year2 <- as.numeric(year2)
+imdbRating2 <- as.numeric(imdbRating2)
+metascore2 <- as.numeric(metascore2)
+rottenscore2 <- as.numeric(gsub('.{1}$', '', r_rottenscore2))
+imdbVote2 <- gsub(",","",imdbVote2)
+imdbVote2 <- as.numeric(imdbVote2)
+
+resDF <- cbind(title, year, release, rated, runtime, action, adventure, crime, drama,
+               fantasy, thriller, documentary, horror, scifi, war, comedy, family, mystery, romance,
+               animation, music, biography, history, short, western, language,
+               inEnglish, country, isUSA, awards, imdbRating, metascore,
+               rottenscore, imdbVote, plot, boxoffice, title2, year2, release2,
+               rated2, runtime2, action2, adventure2, crime2, drama2, fantasy2,
+               thriller2, documentary2, horror2, scifi2, war2, comedy2, family2, mystery2, romance2,
+               animation2, music2, biography2, history2, short2, western2, language2,
+               inEnglish2, country2, isUSA2, awards2, imdbRating2, metascore2, rottenscore2,
+               imdbVote2, plot2, boxoffice2)
+
+# write.csv(resDF, "data-fin.csv")
+```
